@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.paperclip.pro-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>node</string>
+    <string>/Users/prateekgaur/Developer/paperclip/cli/node_modules/tsx/dist/cli.mjs</string>
+    <string>/Users/prateekgaur/Developer/paperclip/scripts/pro-bridge.ts</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PRO_BRIDGE_HOST</key>
+    <string>0.0.0.0</string>
+    <key>PRO_BRIDGE_PORT</key>
+    <string>3211</string>
+    <key>PRO_BRIDGE_ORIGIN_HOST</key>
+    <string>pro</string>
+    <key>PRO_BRIDGE_EXECUTION_TARGET</key>
+    <string>pro-bridge</string>
+    <key>PRO_BRIDGE_PUBLIC_BASE_URL</key>
+    <string>http://pro:3211</string>
+    <key>PRO_BRIDGE_CONFIG</key>
+    <string>/Users/prateekgaur/Developer/paperclip/examples/pro-bridge.config.example.json</string>
+    <key>PRO_BRIDGE_WEBHOOK_BEARER</key>
+    <string>replace-me</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/prateekgaur/Developer/paperclip</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/paperclip-pro-bridge.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/paperclip-pro-bridge.err.log</string>
+</dict>
+</plist>

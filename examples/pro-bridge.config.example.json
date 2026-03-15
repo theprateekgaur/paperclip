@@ -1,0 +1,30 @@
+{
+  "profiles": {
+    "dexter-codex-nightly": {
+      "cwd": "/Users/prateekgaur/Developer/dexter",
+      "command": ["codex", "--full-auto", "Run the nightly Dexter polish checklist"],
+      "env": {
+        "REPO_SLUG": "dexter",
+        "AUTOMATION_SOURCE": "paperclip"
+      },
+      "metadata": {
+        "repo": "dexter",
+        "runtime": "codex_cli",
+        "automation": "nightly_polish"
+      }
+    },
+    "dexter-cursor-nightly": {
+      "cwd": "/Users/prateekgaur/Developer/dexter",
+      "command": ["agent", "-p", "Run the nightly Dexter polish sweep", "--output-format", "stream-json"],
+      "env": {
+        "REPO_SLUG": "dexter",
+        "AUTOMATION_SOURCE": "paperclip"
+      },
+      "metadata": {
+        "repo": "dexter",
+        "runtime": "cursor",
+        "automation": "nightly_polish"
+      }
+    }
+  }
+}
