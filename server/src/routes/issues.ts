@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
+import { issueExecutionDecisions } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
   createIssueAttachmentMetadataSchema,
@@ -47,8 +49,14 @@ import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
-import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
+import {
+  isInlineAttachmentContentType,
+  MAX_ATTACHMENT_BYTES,
+  normalizeContentType,
+  SVG_CONTENT_TYPE,
+} from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -341,6 +349,9 @@ export function issueRoutes(
       unreadForUserFilterRaw === "me" && req.actor.type === "board"
         ? req.actor.userId
         : unreadForUserFilterRaw;
+    const rawLimit = req.query.limit as string | undefined;
+    const parsedLimit = rawLimit ? Number.parseInt(rawLimit, 10) : null;
+    const limit = parsedLimit ?? undefined;
 
     if (assigneeUserFilterRaw === "me" && (!assigneeUserId || req.actor.type !== "board")) {
       res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
@@ -356,6 +367,10 @@ export function issueRoutes(
     }
     if (unreadForUserFilterRaw === "me" && (!unreadForUserId || req.actor.type !== "board")) {
       res.status(403).json({ error: "unreadForUserId=me requires board authentication" });
+      return;
+    }
+    if (rawLimit !== undefined && (parsedLimit === null || !Number.isInteger(parsedLimit) || parsedLimit <= 0)) {
+      res.status(400).json({ error: "limit must be a positive integer" });
       return;
     }
 
@@ -376,6 +391,7 @@ export function issueRoutes(
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       q: req.query.q as string | undefined,
+      limit,
     });
     res.json(result);
   });
@@ -1052,6 +1068,7 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const issue = await svc.create(companyId, {
       ...req.body,
+      executionPolicy: normalizeIssueExecutionPolicy(req.body.executionPolicy),
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
@@ -1171,13 +1188,80 @@ export function issueRoutes(
     if (commentBody && reopenRequested === true && isClosed && updateFields.status === undefined) {
       updateFields.status = "todo";
     }
+    if (req.body.executionPolicy !== undefined) {
+      updateFields.executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+    }
+
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: existing,
+      policy:
+        updateFields.executionPolicy !== undefined
+          ? (updateFields.executionPolicy as NonNullable<typeof updateFields.executionPolicy> | null)
+          : normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
+      requestedStatus: typeof updateFields.status === "string" ? updateFields.status : undefined,
+      requestedAssigneePatch: {
+        assigneeAgentId:
+          req.body.assigneeAgentId === undefined ? undefined : (req.body.assigneeAgentId as string | null),
+        assigneeUserId:
+          req.body.assigneeUserId === undefined ? undefined : (req.body.assigneeUserId as string | null),
+      },
+      actor: {
+        agentId: actor.agentId ?? null,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      },
+      commentBody,
+    });
+    const decisionId = transition.decision ? randomUUID() : null;
+    if (decisionId) {
+      const nextExecutionState = transition.patch.executionState;
+      if (!nextExecutionState || typeof nextExecutionState !== "object") {
+        throw new Error("Execution policy decision patch is missing executionState");
+      }
+      transition.patch.executionState = {
+        ...nextExecutionState,
+        lastDecisionId: decisionId,
+      };
+    }
+    Object.assign(updateFields, transition.patch);
+
     let issue;
     try {
-      issue = await svc.update(id, {
-        ...updateFields,
-        actorAgentId: actor.agentId ?? null,
-        actorUserId: actor.actorType === "user" ? actor.actorId : null,
-      });
+      if (transition.decision && decisionId) {
+        const decision = transition.decision;
+        issue = await db.transaction(async (tx) => {
+          const updated = await svc.update(
+            id,
+            {
+              ...updateFields,
+              actorAgentId: actor.agentId ?? null,
+              actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            },
+            tx,
+          );
+          if (!updated) return null;
+
+          await tx.insert(issueExecutionDecisions).values({
+            id: decisionId,
+            companyId: updated.companyId,
+            issueId: updated.id,
+            stageId: decision.stageId,
+            stageType: decision.stageType,
+            actorAgentId: actor.agentId ?? null,
+            actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            outcome: decision.outcome,
+            body: decision.body,
+            createdByRunId: actor.runId ?? null,
+          });
+
+          return updated;
+        });
+      } else {
+        issue = await svc.update(id, {
+          ...updateFields,
+          actorAgentId: actor.agentId ?? null,
+          actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        });
+      }
     } catch (err) {
       if (err instanceof HttpError && err.status === 422) {
         logger.warn(
@@ -1324,8 +1408,8 @@ export function issueRoutes(
       });
 
     }
-
-    const assigneeChanged = assigneeWillChange;
+    const assigneeChanged =
+      issue.assigneeAgentId !== existing.assigneeAgentId || issue.assigneeUserId !== existing.assigneeUserId;
     const statusChangedFromBacklog =
       existing.status === "backlog" &&
       issue.status !== "backlog" &&
@@ -2108,11 +2192,7 @@ export function issueRoutes(
       res.status(400).json({ error: "Missing file field 'file'" });
       return;
     }
-    const contentType = (file.mimetype || "").toLowerCase();
-    if (!isAllowedContentType(contentType)) {
-      res.status(422).json({ error: `Unsupported attachment type: ${contentType || "unknown"}` });
-      return;
-    }
+    const contentType = normalizeContentType(file.mimetype);
     if (file.buffer.length <= 0) {
       res.status(422).json({ error: "Attachment is empty" });
       return;
@@ -2176,11 +2256,17 @@ export function issueRoutes(
     assertCompanyAccess(req, attachment.companyId);
 
     const object = await storage.getObject(attachment.companyId, attachment.objectKey);
-    res.setHeader("Content-Type", attachment.contentType || object.contentType || "application/octet-stream");
+    const responseContentType = normalizeContentType(attachment.contentType || object.contentType);
+    res.setHeader("Content-Type", responseContentType);
     res.setHeader("Content-Length", String(attachment.byteSize || object.contentLength || 0));
     res.setHeader("Cache-Control", "private, max-age=60");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (responseContentType === SVG_CONTENT_TYPE) {
+      res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
+    }
     const filename = attachment.originalFilename ?? "attachment";
-    res.setHeader("Content-Disposition", `inline; filename=\"${filename.replaceAll("\"", "")}\"`);
+    const disposition = isInlineAttachmentContentType(responseContentType) ? "inline" : "attachment";
+    res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);
 
     object.stream.on("error", (err) => {
       next(err);

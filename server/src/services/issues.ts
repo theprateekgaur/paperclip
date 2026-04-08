@@ -80,6 +80,7 @@ export interface IssueFilters {
   originId?: string;
   includeRoutineExecutions?: boolean;
   q?: string;
+  limit?: number;
 }
 
 type IssueRow = typeof issues.$inferSelect;
@@ -911,6 +912,9 @@ export function issueService(db: Db) {
   return {
     list: async (companyId: string, filters?: IssueFilters) => {
       const conditions = [eq(issues.companyId, companyId)];
+      const limit = typeof filters?.limit === "number" && Number.isFinite(filters.limit)
+        ? Math.max(1, Math.floor(filters.limit))
+        : undefined;
       const touchedByUserId = filters?.touchedByUserId?.trim() || undefined;
       const inboxArchivedByUserId = filters?.inboxArchivedByUserId?.trim() || undefined;
       const unreadForUserId = filters?.unreadForUserId?.trim() || undefined;
@@ -999,7 +1003,7 @@ export function issueService(db: Db) {
         END
       `;
       const canonicalLastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
-      const rows = await db
+      const baseQuery = db
         .select()
         .from(issues)
         .where(and(...conditions))
@@ -1009,6 +1013,7 @@ export function issueService(db: Db) {
           desc(canonicalLastActivityAt),
           desc(issues.updatedAt),
         );
+      const rows = limit === undefined ? await baseQuery : await baseQuery.limit(limit);
       const withLabels = await withIssueLabels(db, rows);
       const runMap = await activeRunMapForIssues(db, withLabels);
       const withRuns = withActiveRuns(withLabels, runMap);
@@ -1482,9 +1487,19 @@ export function issueService(db: Db) {
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx);
         }
+        // Self-correcting counter: use MAX(issue_number) + 1 if the counter
+        // has drifted below the actual max, preventing identifier collisions.
+        const [maxRow] = await tx
+          .select({ maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)` })
+          .from(issues)
+          .where(eq(issues.companyId, companyId));
+        const currentMax = maxRow?.maxNum ?? 0;
+
         const [company] = await tx
           .update(companies)
-          .set({ issueCounter: sql`${companies.issueCounter} + 1` })
+          .set({
+            issueCounter: sql`greatest(${companies.issueCounter}, ${currentMax}) + 1`,
+          })
           .where(eq(companies.id, companyId))
           .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
 
@@ -1547,12 +1562,13 @@ export function issueService(db: Db) {
         actorAgentId?: string | null;
         actorUserId?: string | null;
       },
+      dbOrTx: any = db,
     ) => {
-      const existing = await db
+      const existing = await dbOrTx
         .select()
         .from(issues)
         .where(eq(issues.id, id))
-        .then((rows) => rows[0] ?? null);
+        .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
       if (!existing) return null;
 
       const {
@@ -1624,7 +1640,7 @@ export function issueService(db: Db) {
         patch.checkoutRunId = null;
       }
 
-      return db.transaction(async (tx) => {
+      const runUpdate = async (tx: any) => {
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
@@ -1648,7 +1664,7 @@ export function issueService(db: Db) {
           .set(patch)
           .where(eq(issues.id, id))
           .returning()
-          .then((rows) => rows[0] ?? null);
+          .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
@@ -1667,7 +1683,9 @@ export function issueService(db: Db) {
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
-      });
+      };
+
+      return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
     },
 
     remove: (id: string) =>
