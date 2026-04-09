@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -1997,6 +1997,18 @@ export function heartbeatService(db: Db) {
       return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
+    const wakeReason = readNonEmptyString(contextSnapshot.wakeReason);
+    if (wakeReason === "issue_commented" || wakeReason === "issue_comment_mentioned" || wakeReason === "issue_reopened_via_comment") {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
     const postedComment = await findRunIssueComment(run.id, run.companyId, issueId);
     if (postedComment) {
       await patchRunIssueCommentStatus(run.id, {
@@ -2214,6 +2226,29 @@ export function heartbeatService(db: Db) {
     });
 
     await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
+
+    // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
+    // not at queue time. Guard is idempotent — safe if called more than once.
+    const claimedIssueId = readNonEmptyString(parseObject(claimed.contextSnapshot).issueId);
+    if (claimedIssueId) {
+      const claimedAgent = await getAgent(claimed.agentId);
+      await db
+        .update(issues)
+        .set({
+          executionRunId: claimed.id,
+          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+          executionLockedAt: claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(
+          and(
+            eq(issues.id, claimedIssueId),
+            eq(issues.companyId, claimed.companyId),
+            or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
+          ),
+        );
+    }
+
     return claimed;
   }
 
@@ -3940,15 +3975,9 @@ export function heartbeatService(db: Db) {
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: newRun.id,
-            executionAgentNameKey: agentNameKey,
-            executionLockedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(issues.id, issue.id));
+        // executionRunId is NOT stamped here (enqueueWakeup queues the run but
+        // doesn't start it). It will be stamped in claimQueuedRun() once the run
+        // transitions to "running" — Fix A (lazy locking).
 
         return { kind: "queued" as const, run: newRun };
       });
