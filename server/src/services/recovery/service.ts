@@ -3,11 +3,14 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   agentWakeupRequests,
+  approvals,
   companies,
   heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
+  issueApprovals,
   issueRelations,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
@@ -1540,7 +1543,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function collectIssueGraphLivenessFindings() {
-    const [issueRows, relationRows, agentRows, activeRunRows, activeIssueRunRows, wakeRows] = await Promise.all([
+    const [
+      issueRows,
+      relationRows,
+      agentRows,
+      activeRunRows,
+      activeIssueRunRows,
+      wakeRows,
+      interactionRows,
+      approvalRows,
+      recoveryIssueRows,
+    ] = await Promise.all([
       db
         .select({
           id: issues.id,
@@ -1617,7 +1630,49 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         })
         .from(agentWakeupRequests)
         .where(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])),
+      db
+        .select({
+          companyId: issueThreadInteractions.companyId,
+          issueId: issueThreadInteractions.issueId,
+          status: issueThreadInteractions.status,
+        })
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.status, "pending")),
+      db
+        .select({
+          companyId: issueApprovals.companyId,
+          issueId: issueApprovals.issueId,
+          status: approvals.status,
+        })
+        .from(issueApprovals)
+        .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+        .where(inArray(approvals.status, ["pending", "revision_requested"])),
+      db
+        .select({
+          companyId: issues.companyId,
+          id: issues.id,
+          status: issues.status,
+          originId: issues.originId,
+        })
+        .from(issues)
+        .where(
+          and(
+            isNull(issues.hiddenAt),
+            eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+            notInArray(issues.status, ["done", "cancelled"]),
+          ),
+        ),
     ]);
+
+    const openRecoveryIssues = recoveryIssueRows.flatMap((row) => {
+      const issueId = readNonEmptyString(row.originId);
+      if (!issueId) return [];
+      return [{
+        companyId: row.companyId,
+        issueId,
+        status: row.status,
+      }];
+    });
 
     return classifyIssueGraphLiveness({
       issues: issueRows,
@@ -1640,6 +1695,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         status: row.status,
         issueId: issueIdFromWakePayload(row.payload),
       })),
+      pendingInteractions: interactionRows,
+      pendingApprovals: approvalRows,
+      openRecoveryIssues,
     });
   }
 
